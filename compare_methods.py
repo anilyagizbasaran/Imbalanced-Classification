@@ -1,14 +1,20 @@
+import sys
 import numpy as np
 import warnings
+import json
+sys.stdout.reconfigure(encoding='utf-8')
 from sklearn.model_selection import StratifiedKFold
 from sklearn.svm import SVC
-from sklearn.metrics import roc_auc_score, confusion_matrix
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import (roc_auc_score, confusion_matrix,
+                             f1_score, matthews_corrcoef)
 from sklearn.preprocessing import StandardScaler
+from scipy.stats import wilcoxon
 
 from keel_utils import load_keel_dat
 from BNF import apply_bnf
 from OBN import apply_obn
-from DBSCAN import apply_dbscan_clustering, SAFE, BORDERLINE
+from DBSCAN import apply_dbscan_clustering, find_adaptive_eps, SAFE, BORDERLINE
 from SMOTE import apply_custom_smote
 from RUS import apply_rus_majority
 
@@ -26,9 +32,20 @@ def g_mean_score(y_true, y_pred):
 
 def safe_auc(clf, X_test, y_test):
     try:
-        return roc_auc_score(y_test, clf.decision_function(X_test))
+        if hasattr(clf, 'decision_function'):
+            scores = clf.decision_function(X_test)
+        else:
+            scores = clf.predict_proba(X_test)[:, 1]
+        return roc_auc_score(y_test, scores)
     except Exception:
         return 0.5
+
+
+def make_classifier(clf_type):
+    if clf_type == 'rf':
+        return RandomForestClassifier(
+            n_estimators=100, random_state=42, class_weight='balanced', n_jobs=-1)
+    return SVC(kernel='rbf', random_state=42, class_weight='balanced')
 
 
 def build_rus_dataset(X_tr, y_tr):
@@ -44,7 +61,7 @@ def build_dbscan_dataset(X_tr, y_tr):
     maj_idx = np.where(y_tr == 0)[0]
     X_maj   = X_tr[maj_idx]
 
-    eps = 0.5 * np.sqrt(X_maj.shape[1])
+    eps = find_adaptive_eps(X_maj, k=5)
     categories, _ = apply_dbscan_clustering(X_maj, eps=eps, min_samples=5)
 
     if len(categories) == 0:
@@ -66,13 +83,6 @@ def build_smote_dataset(X_tr, y_tr):
 
 
 def build_bod_dataset(X_tr, y_tr, verbose=False):
-    """
-    BOD under-sampling pipeline — Peng & Park (2022), Algorithm 2.
-      1. BNF  : remove borderline-noise majority samples
-      2. OBN  : remove outlier majority samples
-      3. DBSCAN: Safe+Borderline -> apply RUS (target=n_min); Rare+Outlier -> protect
-      4. Final: RUS(Safe) + Rare + Minority
-    """
     maj_idx = np.where(y_tr == 0)[0]
     X_maj   = X_tr[maj_idx]
     n_min   = int(np.sum(y_tr == 1))
@@ -82,7 +92,7 @@ def build_bod_dataset(X_tr, y_tr, verbose=False):
 
     remove_local = (bnf_mask | obn_mask)[maj_idx]
 
-    eps = 0.5 * np.sqrt(X_maj.shape[1])
+    eps = find_adaptive_eps(X_maj, k=5)
     categories, _ = apply_dbscan_clustering(X_maj, eps=eps, min_samples=5)
 
     if len(categories) == 0:
@@ -110,9 +120,10 @@ def build_bod_dataset(X_tr, y_tr, verbose=False):
     return np.vstack([xp for xp, _ in parts]), np.hstack([yp for _, yp in parts])
 
 
-def run_analysis(dataset_name):
+def run_analysis(dataset_name, clf_type='svm'):
+    clf_label = 'SVM (RBF, cost-sensitive)' if clf_type == 'svm' else 'Random Forest (100 trees, balanced)'
     report  = f"\n{'='*80}\n"
-    report += f"DATASET: {dataset_name.upper()}\n"
+    report += f"DATASET: {dataset_name.upper()}  |  CLASSIFIER: {clf_label}\n"
     report += f"{'='*80}\n"
 
     try:
@@ -127,14 +138,13 @@ def run_analysis(dataset_name):
     ir    = n_maj / max(n_min, 1)
     report += f"  Samples : {len(X)}  |  Features : {X.shape[1]}\n"
     report += f"  Majority: {n_maj}  |  Minority : {n_min}  |  IR : {ir:.2f}\n"
-    report += f"  Classifier: SVM (RBF kernel, C=1, gamma='scale') + StandardScaler\n"
     report += f"  Evaluation: 5-fold Stratified Cross-Validation  (random_state=42)\n"
     report += f"{'-'*80}\n"
 
     skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
 
     model_names = ['Baseline', 'RUS', 'DBSCAN', 'SMOTE', 'BOD']
-    results     = {m: {'auc': [], 'gmean': []} for m in model_names}
+    results     = {m: {'auc': [], 'gmean': [], 'f1': [], 'mcc': []} for m in model_names}
     fold_log    = []
 
     for fold, (train_idx, test_idx) in enumerate(skf.split(X, y), 1):
@@ -148,38 +158,27 @@ def run_analysis(dataset_name):
         X_train = sc.fit_transform(X_train)
         X_test  = sc.transform(X_test)
 
-        clf      = SVC(kernel='rbf', random_state=42)
         fold_aucs = {}
 
-        clf.fit(X_train, y_train)
-        fold_aucs['Baseline'] = safe_auc(clf, X_test, y_test)
-        results['Baseline']['auc'].append(fold_aucs['Baseline'])
-        results['Baseline']['gmean'].append(g_mean_score(y_test, clf.predict(X_test)))
+        datasets_fold = {
+            'Baseline': (X_train, y_train),
+            'RUS':      build_rus_dataset(X_train, y_train),
+            'DBSCAN':   build_dbscan_dataset(X_train, y_train),
+            'SMOTE':    build_smote_dataset(X_train, y_train),
+            'BOD':      build_bod_dataset(X_train, y_train),
+        }
 
-        X_r, y_r = build_rus_dataset(X_train, y_train)
-        clf.fit(X_r, y_r)
-        fold_aucs['RUS'] = safe_auc(clf, X_test, y_test)
-        results['RUS']['auc'].append(fold_aucs['RUS'])
-        results['RUS']['gmean'].append(g_mean_score(y_test, clf.predict(X_test)))
+        for m in model_names:
+            clf = make_classifier(clf_type)
+            X_tr_m, y_tr_m = datasets_fold[m]
+            clf.fit(X_tr_m, y_tr_m)
+            y_pred = clf.predict(X_test)
 
-        X_d, y_d = build_dbscan_dataset(X_train, y_train)
-        clf.fit(X_d, y_d)
-        fold_aucs['DBSCAN'] = safe_auc(clf, X_test, y_test)
-        results['DBSCAN']['auc'].append(fold_aucs['DBSCAN'])
-        results['DBSCAN']['gmean'].append(g_mean_score(y_test, clf.predict(X_test)))
-
-        X_s, y_s = build_smote_dataset(X_train, y_train)
-        clf.fit(X_s, y_s)
-        fold_aucs['SMOTE'] = safe_auc(clf, X_test, y_test)
-        results['SMOTE']['auc'].append(fold_aucs['SMOTE'])
-        results['SMOTE']['gmean'].append(g_mean_score(y_test, clf.predict(X_test)))
-
-        print(f"  Fold {fold}: Running BOD pipeline...")
-        X_b, y_b = build_bod_dataset(X_train, y_train)
-        clf.fit(X_b, y_b)
-        fold_aucs['BOD'] = safe_auc(clf, X_test, y_test)
-        results['BOD']['auc'].append(fold_aucs['BOD'])
-        results['BOD']['gmean'].append(g_mean_score(y_test, clf.predict(X_test)))
+            results[m]['auc'].append(safe_auc(clf, X_test, y_test))
+            results[m]['gmean'].append(g_mean_score(y_test, y_pred))
+            results[m]['f1'].append(f1_score(y_test, y_pred, average='macro', zero_division=0))
+            results[m]['mcc'].append(matthews_corrcoef(y_test, y_pred))
+            fold_aucs[m] = results[m]['auc'][-1]
 
         fold_log.append(fold_aucs)
         print(f"  Fold {fold} complete.")
@@ -200,50 +199,81 @@ def run_analysis(dataset_name):
     avg = lambda m, k: np.mean(results[m][k]) if results[m][k] else 0.0
     std = lambda m, k: np.std(results[m][k])  if results[m][k] else 0.0
 
+    base_auc     = avg('Baseline', 'auc')
+    best_auc_key = max(model_names, key=lambda m: avg(m, 'auc'))
+
+    report += (f"  {'METHOD':<28} | {'AUC':>7} | {'±':>6} | "
+               f"{'G-MEAN':>7} | {'F1':>7} | {'MCC':>7} | {'GAIN':>7}\n")
+    report += f"  {'-'*80}\n"
     labels = [
-        ('1. Baseline (SVM)',       'Baseline'),
-        ('2. SVM + RUS',            'RUS'),
-        ('3. SVM + DBSCAN',         'DBSCAN'),
-        ('4. SVM + SMOTE',          'SMOTE'),
-        ('5. SVM + BOD (proposed)', 'BOD'),
+        ('1. Baseline',       'Baseline'),
+        ('2. RUS',            'RUS'),
+        ('3. DBSCAN',         'DBSCAN'),
+        ('4. SMOTE',          'SMOTE'),
+        ('5. BOD (proposed)', 'BOD'),
     ]
-
-    base_auc      = avg('Baseline', 'auc')
-    best_auc_key  = max(model_names, key=lambda m: avg(m, 'auc'))
-
-    report += f"  {'METHOD':<28} | {'AUC (mean)':>10} | {'AUC (std)':>9} | {'G-MEAN':>8} | {'GAIN AUC':>10}\n"
-    report += f"  {'-'*75}\n"
     for label, key in labels:
-        a      = avg(key, 'auc')
-        s      = std(key, 'auc')
-        g      = avg(key, 'gmean')
-        gain   = f"{a - base_auc:>+10.4f}" if key != 'Baseline' else f"{'Reference':>10}"
-        marker = " (*)" if key == best_auc_key else "    "
-        report += f"  {label:<28} | {a:>10.4f} | {s:>9.4f} | {g:>8.4f} | {gain}{marker}\n"
-    report += f"  {'-'*75}\n"
-    report += f"  (*) = best AUC for this dataset\n\n"
+        a    = avg(key, 'auc')
+        s    = std(key, 'auc')
+        g    = avg(key, 'gmean')
+        f1   = avg(key, 'f1')
+        mcc  = avg(key, 'mcc')
+        gain = f"{a - base_auc:>+7.4f}" if key != 'Baseline' else f"{'ref':>7}"
+        mark = " (*)" if key == best_auc_key else "    "
+        report += (f"  {label:<28} | {a:>7.4f} | {s:>6.4f} | "
+                   f"{g:>7.4f} | {f1:>7.4f} | {mcc:>7.4f} | {gain}{mark}\n")
+    report += f"  {'-'*80}\n"
+    report += f"  (*) = best AUC\n\n"
 
     bod_gain = avg('BOD', 'auc') - base_auc
     bod_rank = sorted(model_names, key=lambda m: avg(m, 'auc'), reverse=True).index('BOD') + 1
-    report += f"  BOD rank   : {bod_rank} / {len(model_names)}\n"
-    report += f"  BOD AUC gain vs Baseline: {bod_gain:+.4f}\n"
-    report += ("  >> SUCCESS: BOD outperformed Baseline SVM.\n"
-               if bod_gain > 0 else
-               "  >> NOTE: BOD did not improve AUC for this dataset.\n")
+    report += f"  BOD rank: {bod_rank}/{len(model_names)}  |  AUC gain vs Baseline: {bod_gain:+.4f}\n"
     report += f"{'='*80}\n"
 
     print(report)
     return report, {
-        'dataset':      dataset_name,
-        'ir':           ir,
-        'bod_auc':      avg('BOD', 'auc'),
-        'base_auc':     base_auc,
-        'bod_gain':     bod_gain,
-        'bod_rank':     bod_rank,
-        'best_method':  best_auc_key,
-        'aucs':         {m: avg(m, 'auc')   for m in model_names},
-        'gmeans':       {m: avg(m, 'gmean') for m in model_names},
+        'dataset':     dataset_name,
+        'clf_type':    clf_type,
+        'ir':          ir,
+        'bod_auc':     avg('BOD', 'auc'),
+        'base_auc':    base_auc,
+        'bod_gain':    bod_gain,
+        'bod_rank':    bod_rank,
+        'best_method': best_auc_key,
+        'aucs':        {m: avg(m, 'auc')   for m in model_names},
+        'gmeans':      {m: avg(m, 'gmean') for m in model_names},
+        'f1s':         {m: avg(m, 'f1')    for m in model_names},
+        'mccs':        {m: avg(m, 'mcc')   for m in model_names},
+        'auc_folds':   {m: results[m]['auc'] for m in model_names},
     }
+
+
+def wilcoxon_section(summaries, model_names):
+    """BOD vs diğer yöntemler arası Wilcoxon signed-rank testi (veri seti başına ortalama AUC)."""
+    lines  = "\n" + "=" * 80 + "\n"
+    lines += "WILCOXON SIGNED-RANK TEST  (BOD vs diğer yöntemler, n=dataset sayısı)\n"
+    lines += "H0: fark yok  |  p < 0.05 → BOD istatistiksel olarak farklı\n"
+    lines += "=" * 80 + "\n"
+    lines += f"  {'Karşılaştırma':<30} | {'W istatistiği':>14} | {'p-değeri':>10} | Sonuç\n"
+    lines += f"  {'-'*65}\n"
+
+    bod_aucs = [s['aucs']['BOD'] for s in summaries]
+    for m in model_names:
+        if m == 'BOD':
+            continue
+        other_aucs = [s['aucs'][m] for s in summaries]
+        diff = np.array(bod_aucs) - np.array(other_aucs)
+        if np.all(diff == 0):
+            lines += f"  {'BOD vs ' + m:<30} | {'N/A':>14} | {'N/A':>10} | Fark yok\n"
+            continue
+        try:
+            stat, p = wilcoxon(bod_aucs, other_aucs, alternative='greater')
+            result = "BOD > " + m + " (p<0.05)" if p < 0.05 else "Anlamlı fark yok"
+            lines += f"  {'BOD vs ' + m:<30} | {stat:>14.4f} | {p:>10.4f} | {result}\n"
+        except Exception as e:
+            lines += f"  {'BOD vs ' + m:<30} | {'hata':>14} | {'hata':>10} | {e}\n"
+    lines += "=" * 80 + "\n"
+    return lines
 
 
 if __name__ == "__main__":
@@ -251,63 +281,91 @@ if __name__ == "__main__":
         "glass1", "yeast1", "haberman", "ecoli1", "segment0", "glass6",
         "yeast2vs4", "glass0146vs2", "yeast1vs7", "glass4", "yeast5", "yeast6",
     ]
-    output_file = "all_results_summary.txt"
-
-    print(f"Starting BOD analysis (Peng & Park 2022)... Results -> '{output_file}'")
-    final_report  = "BOD EXPERIMENTAL RESULTS  --  Peng & Park (2022)\n"
-    final_report += "Classifier : SVM (RBF kernel), StandardScaler, 5-fold Stratified CV\n"
-    final_report += "Metrics    : AUC (mean +/- std over 5 folds), G-mean\n"
-    final_report += "Datasets   : 12 KEEL imbalanced benchmark sets\n"
-    final_report += "=" * 80 + "\n"
-
-    summaries = []
-    for ds in datasets:
-        print(f"\n>>> Dataset: {ds}")
-        report_str, summary = run_analysis(ds)
-        final_report += report_str
-        summaries.append(summary)
-
     model_names = ['Baseline', 'RUS', 'DBSCAN', 'SMOTE', 'BOD']
 
-    final_report += "\n" + "=" * 80 + "\n"
-    final_report += "GLOBAL SUMMARY -- AUC per Dataset\n"
-    final_report += "=" * 80 + "\n"
-    hdr  = f"  {'Dataset':<18} | {'IR':>5} | "
-    hdr += " | ".join(f"{m:>8}" for m in model_names)
-    hdr += " | Best\n"
-    final_report += hdr
-    final_report += (f"  {'-'*18}-+-{'-'*5}-+-"
-                     + "-+-".join("-"*8 for _ in model_names)
-                     + "-+-" + "-"*8 + "\n")
-    for s in summaries:
-        row  = f"  {s['dataset']:<18} | {s['ir']:>5.2f} | "
-        row += " | ".join(f"{s['aucs'][m]:>8.4f}" for m in model_names)
-        row += f" | {s['best_method']}\n"
-        final_report += row
+    for clf_type in ['svm', 'rf']:
+        clf_label  = 'SVM' if clf_type == 'svm' else 'RandomForest'
+        output_file = f"results_{clf_label}.txt"
 
-    final_report += f"\n  {'METHOD':<12} | {'Wins (best AUC)':>15} | {'BOD SUCCESS':>12}\n"
-    final_report += f"  {'-'*45}\n"
-    for m in model_names:
-        wins = sum(1 for s in summaries if s['best_method'] == m)
-        if m == 'BOD':
-            successes = sum(1 for s in summaries if s['bod_gain'] > 0)
-            final_report += f"  {m:<12} | {wins:>15} | {successes:>10}/12\n"
-        else:
-            final_report += f"  {m:<12} | {wins:>15} |\n"
+        print(f"\n{'#'*80}")
+        print(f"# CLASSIFIER: {clf_label}")
+        print(f"{'#'*80}")
 
-    final_report += "\n" + "=" * 80 + "\n"
-    final_report += "BOD PERFORMANCE vs BASELINE (sorted by IR)\n"
-    final_report += "=" * 80 + "\n"
-    final_report += f"  {'Dataset':<18} | {'IR':>5} | {'Baseline':>9} | {'BOD':>9} | {'Gain':>8} | {'Rank':>5} | Result\n"
-    final_report += f"  {'-'*72}\n"
-    for s in sorted(summaries, key=lambda x: x['ir']):
-        status = "SUCCESS" if s['bod_gain'] > 0 else "fail"
-        final_report += (f"  {s['dataset']:<18} | {s['ir']:>5.2f} | "
-                         f"{s['base_auc']:>9.4f} | {s['bod_auc']:>9.4f} | "
-                         f"{s['bod_gain']:>+8.4f} | {s['bod_rank']:>5} | {status}\n")
-    final_report += "=" * 80 + "\n"
+        final_report  = f"BOD EXPERIMENTAL RESULTS  --  Classifier: {clf_label}\n"
+        final_report += "Metrics    : AUC, G-mean, F1 (macro), MCC\n"
+        final_report += "Evaluation : 5-fold Stratified CV  |  Adaptive eps  |  Cost-sensitive weights\n"
+        final_report += "Datasets   : 12 KEEL imbalanced benchmark sets\n"
+        final_report += "=" * 80 + "\n"
 
-    with open(output_file, "w") as f:
-        f.write(final_report)
+        summaries = []
+        for ds in datasets:
+            print(f"\n>>> Dataset: {ds}  [{clf_label}]")
+            report_str, summary = run_analysis(ds, clf_type=clf_type)
+            final_report += report_str
+            if summary:
+                summaries.append(summary)
 
-    print(f"\nDone! See '{output_file}'")
+        # Global AUC tablosu
+        final_report += "\n" + "=" * 80 + "\n"
+        final_report += f"GLOBAL SUMMARY -- AUC per Dataset [{clf_label}]\n"
+        final_report += "=" * 80 + "\n"
+        hdr  = f"  {'Dataset':<18} | {'IR':>5} | "
+        hdr += " | ".join(f"{m:>8}" for m in model_names) + " | Best\n"
+        final_report += hdr
+        final_report += (f"  {'-'*18}-+-{'-'*5}-+-"
+                         + "-+-".join("-"*8 for _ in model_names)
+                         + "-+-" + "-"*8 + "\n")
+        for s in summaries:
+            row  = f"  {s['dataset']:<18} | {s['ir']:>5.2f} | "
+            row += " | ".join(f"{s['aucs'][m]:>8.4f}" for m in model_names)
+            row += f" | {s['best_method']}\n"
+            final_report += row
+
+        # Global F1 tablosu
+        final_report += "\n" + "=" * 80 + "\n"
+        final_report += f"GLOBAL SUMMARY -- F1 (macro) per Dataset [{clf_label}]\n"
+        final_report += "=" * 80 + "\n"
+        final_report += hdr
+        for s in summaries:
+            row  = f"  {s['dataset']:<18} | {s['ir']:>5.2f} | "
+            row += " | ".join(f"{s['f1s'][m]:>8.4f}" for m in model_names)
+            row += f" | {max(model_names, key=lambda m: s['f1s'][m])}\n"
+            final_report += row
+
+        # Global MCC tablosu
+        final_report += "\n" + "=" * 80 + "\n"
+        final_report += f"GLOBAL SUMMARY -- MCC per Dataset [{clf_label}]\n"
+        final_report += "=" * 80 + "\n"
+        final_report += hdr
+        for s in summaries:
+            row  = f"  {s['dataset']:<18} | {s['ir']:>5.2f} | "
+            row += " | ".join(f"{s['mccs'][m]:>8.4f}" for m in model_names)
+            row += f" | {max(model_names, key=lambda m: s['mccs'][m])}\n"
+            final_report += row
+
+        # Kazanım tablosu
+        final_report += "\n" + "=" * 80 + "\n"
+        final_report += f"BOD PERFORMANCE vs BASELINE (sorted by IR) [{clf_label}]\n"
+        final_report += "=" * 80 + "\n"
+        final_report += (f"  {'Dataset':<18} | {'IR':>5} | {'Baseline':>9} | "
+                         f"{'BOD':>9} | {'Gain':>8} | {'Rank':>5} | Sonuç\n")
+        final_report += f"  {'-'*72}\n"
+        for s in sorted(summaries, key=lambda x: x['ir']):
+            status = "BAŞARILI" if s['bod_gain'] > 0 else "iyileşme yok"
+            final_report += (f"  {s['dataset']:<18} | {s['ir']:>5.2f} | "
+                             f"{s['base_auc']:>9.4f} | {s['bod_auc']:>9.4f} | "
+                             f"{s['bod_gain']:>+8.4f} | {s['bod_rank']:>5} | {status}\n")
+        final_report += "=" * 80 + "\n"
+
+        # Wilcoxon testi
+        if len(summaries) >= 5:
+            final_report += wilcoxon_section(summaries, model_names)
+
+        with open(output_file, "w", encoding="utf-8") as f:
+            f.write(final_report)
+
+        json_file = f"results_{clf_label}.json"
+        with open(json_file, "w", encoding="utf-8") as f:
+            json.dump(summaries, f, indent=2)
+
+        print(f"\nTamamlandı! Sonuçlar: '{output_file}'  |  JSON: '{json_file}'")
