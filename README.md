@@ -1,49 +1,58 @@
-# A Hybrid Over-Sampling and Under-Sampling Approach Based on DBSCAN and SMOTE for Imbalanced Classification Problems
+# BOD: Borderline Outlier Detection for Imbalanced Classification
 
-A comprehensive Python implementation of a "Clean-then-Generate" strategy that integrates the Synthetic Minority Over-sampling Technique (SMOTE) into a density-based cleaning pipeline for handling imbalanced datasets.
+Python implementation of the **BOD (Borderline Outlier Detection)** under-sampling pipeline proposed in:
 
-## Research Objective
+> Peng, M., & Park, S. (2022). *A New Hybrid Under-sampling Approach to Imbalanced Classification Problems.* Turk J Elec Eng & Comp Sci.
 
-Class imbalance is a significant challenge in machine learning, as it leads to models that are biased toward the majority class. While traditional methods like the BOD (Borderline Outlier Detection) approach by Peng & Park are effective at noise removal, they often lead to excessive data loss, leaving the minority class underrepresented. 
-
-This study proposes a hybrid framework that:
-- **First cleans** the majority class using DBSCAN to sanitize the data
-- **Then generates** synthetic minority samples using SMOTE in the cleaned, safe regions
-- **Prevents noise amplification** by ensuring SMOTE only operates on sanitized data
-
-By using DBSCAN to sanitize the data before applying SMOTE, we prevent the common issue of noise amplification that occurs when SMOTE is applied to "dirty" data. This synergy allows us to preserve the noise-immunity of the BOD method while solving the data sparsity problem.
-
-## Real-World Applications
-
-The practical necessity of this work is evident in critical domains:
-
-- **Medical Diagnosis**: Missing a rare disease because of a lack of samples can have fatal consequences. Our method ensures rare cases are amplified and recognized.
-- **Financial Fraud Detection**: Fraudulent transactions are extremely rare. Our hybrid approach reinforces these subtle patterns, preventing them from being deleted during the cleaning process.
+---
 
 ## Overview
 
-This project implements a multi-stage "Clean-then-Generate" pipeline for preprocessing imbalanced datasets:
+BOD is a four-stage majority-class cleaning pipeline designed for imbalanced binary classification. Instead of blindly removing random majority samples, it identifies and removes *harmful* samples (borderline noise and outliers) while protecting structurally important ones (rare/isolated samples).
 
-1. **BNF (Borderline Noise Filtering)** - Removes noisy borderline samples from the majority class
-2. **OBN (Outlier Based on Noise)** - Detects and removes outliers from the majority class
-3. **DBSCAN Clustering** - Separates safe (clustered) from rare (noise) majority samples and identifies rare minority instances
-4. **RUS (Random Under Sampling)** - Reduces safe majority samples to match minority count
-5. **SMOTE (Synthetic Minority Oversampling)** - Generates synthetic minority samples around protected rare and borderline points
+### Pipeline
 
-## Requirements
-
-### Python Version
-- Python 3.7 or higher
-
-### Dependencies
-
-Install the required packages using pip:
-
-```bash
-pip install numpy scikit-learn imbalanced-learn matplotlib
+```
+Raw data
+   |
+   v
+[Step 1] BNF  -- iteratively removes borderline majority noise (AUC-guided)
+   |
+   v
+[Step 2] OBN  -- removes isolated majority outliers (OBN score > mean)
+   |
+   v
+[Step 3] DBSCAN -- categorises remaining majority into Safe / Rare
+   |
+   v
+[Step 4] RUS  -- random under-samples Safe majority to n_minority (IR = 1)
+   |
+   v
+Final training set: RUS(Safe) + Rare + Minority
 ```
 
-Or create a `requirements.txt` file with:
+---
+
+## Project Structure
+
+```
+gardprject/
+├── BNF.py                  # Borderline Noise Factor (Yang & Gao 2013)
+├── OBN.py                  # Outlierness Based on Neighborhood (Gupta et al. 2019)
+├── DBSCAN.py               # DBSCAN clustering with Safe/Borderline/Rare/Outlier categories
+├── RUS.py                  # Random Under-Sampling
+├── SMOTE.py                # SMOTE wrapper (used in comparison baseline only)
+├── keel_utils.py           # KEEL .dat file loader
+├── compare_methods.py      # 5-method comparison across 12 datasets
+├── stepwise_visualizer.py  # Per-dataset step-by-step PCA plots
+├── generate_all_plots.py   # Batch plot generation for all datasets
+├── datasets/               # 12 KEEL .dat files
+└── result_images/          # Generated plots (plots_<dataset>/)
+```
+
+---
+
+## Requirements
 
 ```
 numpy>=1.19.0
@@ -52,175 +61,174 @@ imbalanced-learn>=0.8.0
 matplotlib>=3.3.0
 ```
 
-Then install:
-
 ```bash
-pip install -r requirements.txt
+pip install numpy scikit-learn imbalanced-learn matplotlib
 ```
 
-## Installation
-
-1. Clone or download this repository
-2. Install the required dependencies (see Requirements section above)
-3. Ensure your datasets are in the `datasets/` folder in KEEL format (`.dat` files)
-
-## Project Structure
-
-```
-gardprject/
-├── BNF.py                    # Borderline Noise Filtering implementation
-├── OBN.py                    # Outlier Based on Noise detection
-├── DBSCAN.py                 # DBSCAN clustering for safe/rare separation
-├── RUS.py                    # Random Under Sampling
-├── SMOTE.py                  # Custom SMOTE wrapper with safety checks
-├── keel_utils.py             # Utilities for loading KEEL format datasets
-├── compare_methods.py        # Main script for comparing baseline, reference, and proposed methods
-├── stepwise_visualizer.py    # Script for generating step-by-step visualizations
-├── datasets/                 # Directory containing dataset files (.dat format)
-└── README.md                 # This file
-```
+---
 
 ## Usage
 
-### Running the Comparison Analysis
-
-To compare the baseline, reference (Peng & Park method), and proposed (hybrid) methods:
+### Run full comparison (all 12 datasets)
 
 ```bash
 python compare_methods.py
 ```
 
-This will:
-- Process all datasets in the `datasets/` folder
-- Perform 5-fold stratified cross-validation
-- Compare three methods:
-  - **Baseline**: Raw imbalanced data
-  - **Reference**: BNF + DBSCAN + RUS (under-sampling only)
-  - **Proposed**: BNF + DBSCAN + RUS + SMOTE (hybrid approach)
-- Generate results in `all_results_summary.txt`
+Outputs `all_results_summary.txt` with per-fold AUC, mean ± std, G-mean, and rankings for five methods: Baseline, RUS, DBSCAN, SMOTE, BOD.
 
-### Generating Step-by-Step Visualizations
-
-To visualize each preprocessing step for a specific dataset:
+### Generate step-by-step visualizations
 
 ```bash
-python stepwise_visualizer.py --dataset <dataset_name>
+python generate_all_plots.py
 ```
 
-Example:
+Plots are saved to `result_images/plots_<dataset>/`.
+
+Or for a single dataset:
+
 ```bash
 python stepwise_visualizer.py --dataset ecoli1
 ```
 
-Optional parameters:
-- `--datadir`: Directory containing datasets (default: `./datasets`)
-- `--obn_k`: Number of neighbors for OBN (default: 5)
-- `--obn_multiplier`: Multiplier for OBN threshold (default: 1.8)
-- `--dbscan_eps`: Epsilon parameter for DBSCAN (default: 0.5)
-- `--dbscan_min_samples`: Minimum samples for DBSCAN (default: 5)
+---
 
-This will generate visualization plots in the `plots_<dataset_name>/` directory showing:
-- Step 0: Raw data distribution
-- Step 1: BNF noise detection
-- Step 2: OBN outlier detection
-- Step 3: DBSCAN grouping (safe vs rare)
-- Step 4: RUS under-sampling
-- Step 5: SMOTE synthetic generation
-- Step 6: Final balanced dataset
+## Datasets
 
-### Example: Step-by-Step Pipeline Visualization (Haberman Dataset)
+12 KEEL benchmark datasets covering a wide range of imbalance ratios:
 
-The following visualization demonstrates the step-by-step transformation of the Haberman dataset through our hybrid pipeline. Notably, in Step 3, a significant portion of the minority class instances are categorized as 'rare' by the DBSCAN module. This reflects the intrinsic sparsity and high degree of class overlap within the Haberman dataset. Our proposed method utilizes these 'rare' samples as foundational seeds for SMOTE-based synthesis, leading to a 35% F1-score improvement.
+| Dataset | Samples | Features | Majority | Minority | IR |
+|---|---|---|---|---|---|
+| glass1 | 214 | 9 | 138 | 76 | 1.82 |
+| yeast1 | 1484 | 8 | 1055 | 429 | 2.46 |
+| haberman | 306 | 3 | 225 | 81 | 2.78 |
+| ecoli1 | 336 | 7 | 259 | 77 | 3.36 |
+| segment0 | 2308 | 19 | 1979 | 329 | 6.02 |
+| glass6 | 214 | 9 | 185 | 29 | 6.38 |
+| yeast2vs4 | 514 | 8 | 463 | 51 | 9.08 |
+| glass0146vs2 | 205 | 9 | 188 | 17 | 11.06 |
+| yeast1vs7 | 459 | 7 | 429 | 30 | 14.30 |
+| glass4 | 214 | 9 | 201 | 13 | 15.46 |
+| yeast5 | 1484 | 8 | 1440 | 44 | 32.73 |
+| yeast6 | 1484 | 8 | 1449 | 35 | 41.40 |
 
-| Step 0: Raw Data | Step 1: BNF Filtering | Step 2: OBN Detection |
+---
+
+## Step-by-Step Visualizations
+
+Each dataset produces 6 PCA projection plots showing the pipeline state at each stage. Examples below.
+
+### ecoli1 (IR = 3.36)
+
+| Step 0: Raw Data | Step 1: BNF | Step 2: OBN |
 |:---:|:---:|:---:|
-| ![Raw Data](plots_haberman/haberman_step0_raw.png) | ![BNF](plots_haberman/haberman_step1_bnf.png) | ![OBN](plots_haberman/haberman_step2_obn.png) |
+| ![](result_images/plots_ecoli1/ecoli1_step0_raw.png) | ![](result_images/plots_ecoli1/ecoli1_step1_bnf.png) | ![](result_images/plots_ecoli1/ecoli1_step2_obn.png) |
 
-| Step 3: DBSCAN Grouping | Step 4: RUS Under-sampling | Step 5: SMOTE Generation |
+| Step 3: DBSCAN | Step 4: RUS | Step 5: Final |
 |:---:|:---:|:---:|
-| ![DBSCAN](plots_haberman/haberman_step3_dbscan.png) | ![RUS](plots_haberman/haberman_step4_rus.png) | ![SMOTE](plots_haberman/haberman_step5_hybrid_smote.png) |
+| ![](result_images/plots_ecoli1/ecoli1_step3_dbscan.png) | ![](result_images/plots_ecoli1/ecoli1_step4_rus.png) | ![](result_images/plots_ecoli1/ecoli1_step5_final.png) |
 
-| Step 6: Final Balanced Dataset |
-|:---:|
-| ![Final](plots_haberman/haberman_step6_final_clean.png) |
+---
 
-## Methodology
+### yeast1vs7 (IR = 14.30)
 
-The proposed methodology follows a sequential "Clean-then-Generate" logic:
+| Step 0: Raw Data | Step 1: BNF | Step 2: OBN |
+|:---:|:---:|:---:|
+| ![](result_images/plots_yeast1vs7/yeast1vs7_step0_raw.png) | ![](result_images/plots_yeast1vs7/yeast1vs7_step1_bnf.png) | ![](result_images/plots_yeast1vs7/yeast1vs7_step2_obn.png) |
 
-### 1. Noise Filtering (BNF & OBN)
-**Purpose**: Preliminary cleaning to identify and remove majority-class noise and outliers that could mislead the classifier.
+| Step 3: DBSCAN | Step 4: RUS | Step 5: Final |
+|:---:|:---:|:---:|
+| ![](result_images/plots_yeast1vs7/yeast1vs7_step3_dbscan.png) | ![](result_images/plots_yeast1vs7/yeast1vs7_step4_rus.png) | ![](result_images/plots_yeast1vs7/yeast1vs7_step5_final.png) |
 
-- **BNF (Borderline Noise Filtering)**: Identifies majority class samples that are close to minority class regions (borderline examples). Iteratively removes borderline samples if removal improves AUC score using Gaussian Naive Bayes classifier.
-- **OBN (Outlier Based on Noise)**: Computes outlier scores based on mean distance to k-nearest neighbors. Removes majority class samples with scores above threshold (mean + multiplier × std).
+---
 
-### 2. Density-Based Categorization (DBSCAN)
-**Purpose**: Critical stage for identifying "rare" minority samples that require protection from aggressive pruning.
+### yeast6 (IR = 41.40)
 
-- Separates remaining instances into clusters (Safe, Borderline, Rare, Outlier)
-- **Safe**: Clustered majority samples (can be safely removed)
-- **Rare**: Noise samples (protected from removal) - these are vital anchors for synthetic generation
-- This stage is crucial because in high-overlap scenarios, many minority instances are categorized as 'rare', which our method treats as foundational seeds for SMOTE-based synthesis
+| Step 0: Raw Data | Step 1: BNF | Step 2: OBN |
+|:---:|:---:|:---:|
+| ![](result_images/plots_yeast6/yeast6_step0_raw.png) | ![](result_images/plots_yeast6/yeast6_step1_bnf.png) | ![](result_images/plots_yeast6/yeast6_step2_obn.png) |
 
-### 3. Majority Pruning (RUS)
-**Purpose**: Reduces class cardinality to the target ratio without losing critical boundary information.
+| Step 3: DBSCAN | Step 4: RUS | Step 5: Final |
+|:---:|:---:|:---:|
+| ![](result_images/plots_yeast6/yeast6_step3_dbscan.png) | ![](result_images/plots_yeast6/yeast6_step4_rus.png) | ![](result_images/plots_yeast6/yeast6_step5_final.png) |
 
-- Random Under-Sampling (RUS) is applied specifically to majority class instances located in "safe" regions
-- Reduces safe majority samples to match minority class count
-- Ensures balanced dataset for training
-
-### 4. Synthetic Augmentation (SMOTE)
-**Purpose**: Strengthens decision boundaries in overlapping regions by generating synthetic instances around protected rare and borderline minority points.
-
-- Generates synthetic minority samples using k-nearest neighbors
-- Operates only on "sanitized" data (after DBSCAN cleaning), preventing noise amplification
-- Uses rare minority instances as anchors for synthesis, transforming sparse signals into well-defined decision regions
-- Includes safety checks for small datasets
-
-### Key Innovation
-
-The original BOD method by Peng & Park focuses strictly on under-sampling, arguing that over-sampling methods like SMOTE tend to replicate noise. However, we demonstrate that this problem only occurs when SMOTE is applied to "dirty" data. By using DBSCAN as a prior filter, we ensure that SMOTE only generates information in "safe" regions, creating a synergy that preserves noise-immunity while solving data sparsity.
+---
 
 ## Experimental Results
 
-The performance of the proposed Hybrid-SMOTE approach was evaluated across six benchmark datasets with varying Imbalance Ratios (IR). The comparison includes:
+Classifier: SVM (RBF kernel, C=1, gamma='scale') with StandardScaler.
+Evaluation: 5-fold stratified cross-validation (random_state=42).
 
-- **Baseline**: Raw imbalanced data (SVM classifier)
-- **Reference (RUS)**: BNF + DBSCAN + RUS (under-sampling only) - Peng & Park method
-- **Proposed (Hybrid)**: BNF + DBSCAN + RUS + SMOTE (hybrid approach)
+### BOD vs Baseline AUC (sorted by IR)
 
-### Key Findings
+| Dataset | IR | Baseline | BOD | Gain | Result |
+|---|---|---|---|---|---|
+| glass1 | 1.82 | 0.7572 | 0.7578 | +0.0005 | SUCCESS |
+| yeast1 | 2.46 | 0.7832 | 0.7813 | -0.0019 | -- |
+| haberman | 2.78 | 0.7015 | 0.7103 | +0.0088 | SUCCESS |
+| ecoli1 | 3.36 | 0.9490 | 0.9429 | -0.0062 | -- |
+| segment0 | 6.02 | 0.9997 | 0.9993 | -0.0004 | -- |
+| glass6 | 6.38 | 0.9883 | 0.9793 | -0.0090 | -- |
+| yeast2vs4 | 9.08 | 0.9812 | 0.9743 | -0.0069 | -- |
+| glass0146vs2 | 11.06 | 0.6632 | 0.7021 | +0.0389 | SUCCESS |
+| yeast1vs7 | 14.30 | 0.6830 | 0.7967 | +0.1136 | SUCCESS |
+| glass4 | 15.46 | 0.9868 | 0.9635 | -0.0233 | -- |
+| yeast5 | 32.73 | 0.9798 | 0.9823 | +0.0025 | SUCCESS |
+| yeast6 | 41.40 | 0.8438 | 0.9374 | +0.0936 | SUCCESS |
 
-1. **Impact on Overlapping Classes**: The most significant breakthrough was observed in the Haberman dataset (IR: 2.78, high feature overlap). The reference BOD method slightly decreased the F1-score compared to the baseline, suggesting that pure under-sampling leads to critical information loss. However, our Hybrid-SMOTE approach achieved a **35.3% improvement in F1-score** by populating the "rare" regions identified by DBSCAN with synthetic minority samples.
+**BOD succeeds on 6/12 datasets.** Gains are most pronounced at high imbalance ratios (IR >= 14), consistent with the paper's findings.
 
-2. **Resilience Against Noise**: In datasets like Glass1 and Yeast1, the Hybrid method consistently outperformed the reference BOD method in terms of both AUC and F1-score. This confirms that cleaning majority-class noise creates a "sanitized space" where SMOTE can generate high-quality data points without the risk of noise amplification.
+### Win count (best AUC per dataset)
 
-3. **Sensitivity in Well-Separated Domains**: In datasets like Segment0 and Ecoli1, where the baseline AUC is already extremely high (>0.99), we observed a marginal decrease of approximately 0.2%. This indicates that in linearly separable or "easy" classification tasks, the introduction of synthetic minority points can lead to slight over-generalization. Therefore, our method is highly specialized for complex, "messy" data distributions where simple boundaries fail to form.
+| Method | Wins |
+|---|---|
+| Baseline | 4 |
+| SMOTE | 4 |
+| RUS | 3 |
+| BOD | 1 |
+| DBSCAN | 0 |
 
-### Performance Summary
+> Note: Exact numerical values differ from the paper due to SVM hyperparameter differences. The paper uses optimized C and gamma (Liu et al. 2015); this implementation uses sklearn defaults. The algorithmic pipeline is identical to the paper's description.
 
-The comparison script generates a summary report (`all_results_summary.txt`) containing:
-- AUC scores and F1-scores for each method across all datasets
-- Performance gains compared to baseline
-- Analysis of hybrid method improvements over reference method
+---
 
-## Technical Notes
+## Algorithm Details
 
-- All random operations use fixed seeds (random_state=42) for reproducibility
-- The code uses stratified cross-validation to ensure both classes are present in test sets
-- The pipeline includes safety checks to handle edge cases (e.g., very small datasets)
-- Minority class samples are intentionally kept intact during cleaning to preserve critical information
-- The method is context-dependent: most effective in high-overlap, complex classification scenarios
+### BNF (Borderline Noise Factor)
 
-## Citation
-
-If you use this code in your research, please cite:
+Identifies majority samples in the overlap region (SOVR) and iteratively removes the one with the highest BNF score if removal improves validation AUC:
 
 ```
-A hybrid over-sampling and under-sampling approach based on DBSCAN and SMOTE 
-for imbalanced classification problems. Turk J Elec Eng & Comp Sci (2026).
+BNF(x) = alpha * (Ks + delta) / (|kNS(x)| + delta) + beta * |kND(x)|
+alpha=0.3, beta=0.7, delta=0.5, Ks=k
 ```
+
+SOVR is built by scanning all k-NN relationships: if sample `xtrn` is a neighbor of an opposite-class sample `xtr`, then `xtrn` enters SOVR.
+
+### OBN (Outlierness Based on Neighborhood)
+
+Scores each majority sample by how isolated it is relative to its neighbors:
+
+```
+OBN(xi) = W[Nr(xi)] / sum_{yj in Nr(xi)} W[Nr(yj)]
+W[Nr(xi)] = sum of k-NN distances from xi
+```
+
+Samples with `OBN(xi) > mean(OBN)` are removed.
+
+### DBSCAN Categories
+
+| Category | Condition | Action |
+|---|---|---|
+| SAFE (0) | core point (in cluster) | apply RUS |
+| BORDERLINE (1) | border point (in cluster, not core) | apply RUS |
+| RARE (2) | noise point with at least one neighbor within eps | protect |
+| OUTLIER (3) | fully isolated noise point | protect |
+
+`eps = 0.5 * sqrt(n_features)`
+
+---
 
 ## License
 
-This project is provided as-is for research and educational purposes.
+Provided as-is for research and educational purposes.

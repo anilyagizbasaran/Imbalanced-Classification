@@ -1,103 +1,121 @@
 import numpy as np
 from sklearn.neighbors import NearestNeighbors
-from sklearn.naive_bayes import GaussianNB
+from sklearn.svm import SVC
 from sklearn.metrics import roc_auc_score
+from sklearn.model_selection import StratifiedShuffleSplit
 
-def apply_bnf(X, y, k=5, patience=3, verbose=False):
+
+def apply_bnf(X, y, k=5, delta=0.5, verbose=False):
     """
-    Applies Borderline Noise Filtering (BNF).
-    It identifies 'borderline' examples in the majority class and iteratively removes them
-    to maximize the AUC score.
+    BNF (Borderline Noise Factor) — Yang & Gao (2013), adopted in Peng & Park (2022).
 
-    Args:
-        X (np.array): Feature matrix
-        y (np.array): Target vector (0: Majority, 1: Minority)
-        k (int): Number of neighbors to check for borderline detection
-        patience (int): How many steps to continue without improvement
-        verbose (bool): Whether to print progress logs
+    BNF(x) = alpha*(Ks+delta)/(|kNS(x)|+delta) + beta*|kND(x)|
+    alpha=0.3, beta=0.7, delta=0.5, Ks=k
 
-    Returns:
-        X_final, y_final: Cleaned dataset
+    SOVR: a sample enters SOVR because it is a k-NN of an opposite-class sample.
+    Iteratively removes the highest-BNF majority member of SOVR while AUC improves
+    on a held-out 20% stratified validation split.
     """
-    if verbose:
-        print(f"BNF Algorithm Started... Total Candidates: {len(X)}")
+    alpha, beta = 0.3, 0.7
+    n = len(X)
 
-    # Establish baseline AUC score using Gaussian Naive Bayes classifier
-    clf = GaussianNB()
-    clf.fit(X, y)
-    initial_score = roc_auc_score(y, clf.predict_proba(X)[:, 1])
-    
     if verbose:
-        print(f"Initial AUC Score: {initial_score:.4f}")
+        print(f"  [BNF] n={n}, k={k}")
 
-    current_X = X.copy()
-    current_y = y.copy()
-    best_score = initial_score
-    no_improv_count = 0
-    
-    # Identify borderline majority samples (candidates for removal)
-    # A majority sample is considered borderline if most of its k-nearest neighbors are from minority class
-    nbrs = NearestNeighbors(n_neighbors=k+1).fit(current_X)
-    distances, indices = nbrs.kneighbors(current_X)
-    
-    candidates_indices = []
-    
-    for i in range(len(current_X)):
-        if current_y[i] == 0:  # Process only majority class samples
-            neighbors_idx = indices[i][1:]  # Exclude the point itself (indices[i][0])
-            minority_neighbor_count = np.sum(current_y[neighbors_idx] == 1)
-            
-            # Candidate threshold: if >= 50% of neighbors are minority, mark as borderline
-            if minority_neighbor_count >= (k / 2):
-                candidates_indices.append(i)
-    
+    min_cls = min(np.sum(y == 0), np.sum(y == 1))
+    if min_cls < 5:
+        return np.zeros(n, dtype=bool)
+
+    sss = StratifiedShuffleSplit(n_splits=1, test_size=0.2, random_state=42)
+    proc_idx, val_idx = next(sss.split(X, y))
+    X_proc, y_proc = X[proc_idx], y[proc_idx]
+    X_val,  y_val  = X[val_idx],  y[val_idx]
+
+    if len(np.unique(y_val)) < 2:
+        return np.zeros(n, dtype=bool)
+
+    nbrs_all = NearestNeighbors(n_neighbors=k + 1).fit(X_proc)
+    _, nn_idx = nbrs_all.kneighbors(X_proc)
+
+    sovr_set = set()
+    for i in range(len(X_proc)):
+        for nbr in nn_idx[i][1:]:
+            if y_proc[nbr] != y_proc[i]:
+                sovr_set.add(int(nbr))
+
+    sovr = [i for i in sovr_set if y_proc[i] == 0]
+
     if verbose:
-        print(f"Number of Borderline Candidates found: {len(candidates_indices)}")
+        print(f"  [BNF] SOVR majority size: {len(sovr)}")
+    if not sovr:
+        return np.zeros(n, dtype=bool)
 
-    # Iterative removal process: test each candidate removal and keep if AUC improves
-    mask = np.ones(len(current_X), dtype=bool)  # Boolean mask to track which samples to keep
-    removed_count = 0
-    
-    for idx in candidates_indices:
-        # Temporarily remove this sample
-        mask[idx] = False
-        
-        X_temp = current_X[mask]
-        y_temp = current_y[mask]
-        
-        # Safety check: ensure both classes remain after removal
-        if len(np.unique(y_temp)) < 2:
-            mask[idx] = True
+    clf = SVC(kernel='rbf', random_state=42)
+    clf.fit(X_proc, y_proc)
+    best_auc = roc_auc_score(y_val, clf.decision_function(X_val))
+    if verbose:
+        print(f"  [BNF] baseline val AUC: {best_auc:.4f}")
+
+    bnf_local   = np.zeros(len(X_proc), dtype=bool)
+    active      = np.ones(len(X_proc),  dtype=bool)
+    active_sovr = set(sovr)
+
+    while active_sovr:
+        X_cur   = X_proc[active]
+        y_cur   = y_proc[active]
+        act_idx = np.where(active)[0]
+        local   = {g: l for l, g in enumerate(act_idx)}
+
+        n_fit  = min(k + 1, len(X_cur))
+        nn_cur = NearestNeighbors(n_neighbors=n_fit).fit(X_cur)
+        _, nn_loc = nn_cur.kneighbors(X_cur)
+
+        bnf_vals = {}
+        for g in list(active_sovr):
+            if not active[g]:
+                active_sovr.discard(g)
+                continue
+            l       = local[g]
+            nbr_g   = act_idx[nn_loc[l][1:]]
+            kNS = int(np.sum(y_proc[nbr_g] == 0))
+            kND = int(np.sum(y_proc[nbr_g] == 1))
+            bnf_vals[g] = alpha * (k + delta) / (kNS + delta) + beta * kND
+
+        if not bnf_vals:
+            break
+
+        best_g = max(bnf_vals, key=bnf_vals.get)
+        active[best_g] = False
+        X_try, y_try = X_proc[active], y_proc[active]
+
+        if len(np.unique(y_try)) < 2:
+            active[best_g] = True
+            active_sovr.discard(best_g)
             continue
 
-        # Evaluate AUC score after candidate removal
-        clf.fit(X_temp, y_temp)
+        clf.fit(X_try, y_try)
         try:
-            new_score = roc_auc_score(y_temp, clf.predict_proba(X_temp)[:, 1])
-        except ValueError:
-            new_score = 0
-        
-        # Decision: keep removal if AUC improved, otherwise revert
-        if new_score > best_score:
-            best_score = new_score
-            no_improv_count = 0
-            removed_count += 1
+            new_auc = roc_auc_score(y_val, clf.decision_function(X_val))
+        except Exception:
+            active[best_g] = True
+            active_sovr.discard(best_g)
+            continue
+
+        if new_auc >= best_auc:
+            best_auc = new_auc
+            bnf_local[best_g] = True
+            active_sovr.discard(best_g)
             if verbose:
-                print(f"  [Removed] Idx:{idx} -> New AUC: {new_score:.4f} (Improved)")
+                print(f"  [BNF] removed proc_idx={best_g} "
+                      f"BNF={bnf_vals[best_g]:.3f} val_AUC={new_auc:.4f}")
         else:
-            mask[idx] = True  # Revert removal
-            no_improv_count += 1
-        
-        # Early stopping: stop if no improvement for 'patience' consecutive iterations
-        if no_improv_count > patience:
+            active[best_g] = True
             if verbose:
-                print(f"  Patience limit reached ({patience} steps without improvement). Stopping BNF.")
+                print(f"  [BNF] stopped. val_AUC would drop to {new_auc:.4f}")
             break
-            
-    X_final = current_X[mask]
-    y_final = current_y[mask]
-    
+
+    bnf_mask = np.zeros(n, dtype=bool)
+    bnf_mask[proc_idx[bnf_local]] = True
     if verbose:
-        print(f"BNF Completed. Removed: {removed_count} samples. Final Size: {len(X_final)}")
-        
-    return X_final, y_final
+        print(f"  [BNF] done. Removed: {bnf_mask.sum()}")
+    return bnf_mask
